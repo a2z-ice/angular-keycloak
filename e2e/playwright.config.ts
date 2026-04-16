@@ -21,5 +21,25 @@ export default defineConfig({
         screenshot: 'only-on-failure',
       },
     },
+    {
+      name: 'firefox',
+      use: {
+        ...devices['Desktop Firefox'],
+        baseURL: 'https://myecom.net:5500',
+        ignoreHTTPSErrors: true,
+        trace: 'on-first-retry',
+        screenshot: 'only-on-failure',
+      },
+    },
+    {
+      name: 'webkit',
+      use: {
+        ...devices['Desktop Safari'],
+        baseURL: 'https://myecom.net:5500',
+        ignoreHTTPSErrors: true,
+        trace: 'on-first-retry',
+        screenshot: 'only-on-failure',
+      },
+    },
   ],
 });
