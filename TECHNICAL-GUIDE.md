@@ -193,6 +193,203 @@ certs/
 └── keycloak.crt        # idp.keycloak.net certificate (signed by CA)
 ```
 
+### 2.7 Multi-domain certificates (SAN)
+
+Sections 2.2 and 2.3 produce two single-domain certs. A single cert can cover **many** hostnames by listing them as `subjectAltName` (SAN) entries. Use this when:
+
+- You want one cert / one Secret to cover all services (e.g. `myecom.net` + `idp.keycloak.net` + `api.service.net`).
+- You need to add a subdomain (`www.myecom.net`) without regenerating everything.
+- You want a wildcard for an environment (`*.myecom.net`).
+- You need to hit a service by IP during local testing (`127.0.0.1`).
+
+> **Context:** Browsers have ignored the cert's `CN` for name verification since Chrome 58 (2017). Only `subjectAltName` is checked. Single-domain certs still *work* because `generate.sh` puts one `DNS:` entry in SAN — but the pattern scales cleanly to many.
+
+#### 2.7.1 How SAN entries work
+
+The SAN extension is a list of typed names baked into the cert at signing time. Supported types we care about:
+
+| Prefix | Matches | Example |
+|--------|---------|---------|
+| `DNS:` | Exact hostname | `DNS:myecom.net` |
+| `DNS:` (wildcard) | One label only | `DNS:*.myecom.net` matches `api.myecom.net` but **not** `myecom.net` or `a.b.myecom.net` |
+| `IP:` | Literal IP in SNI/address | `IP:127.0.0.1` |
+
+Rules to remember:
+
+- A wildcard covers **exactly one** DNS label. `*.myecom.net` does not match the apex `myecom.net` — if you want both, list both: `DNS:myecom.net,DNS:*.myecom.net`.
+- Names are case-insensitive but write them lowercase.
+- `IP:` entries are distinct from `DNS:` entries; a cert with only `DNS:localhost` will fail if the client connects to `https://127.0.0.1/`.
+- Every name you want to serve must be present *before* signing. You cannot append SANs to an existing cert — you re-sign a new one.
+
+#### 2.7.2 Example: one cert covering both project hostnames
+
+This collapses the two cert pairs (`selfsigned.*` + `keycloak.*`) into a single `myecom-multi.*` pair that serves both `myecom.net` and `idp.keycloak.net`, plus a few extras for future use.
+
+```bash
+# 1. Generate the server key
+openssl genrsa -out myecom-multi.key 2048
+
+# 2. CSR — the CN here is mostly cosmetic; SAN does the real work
+openssl req -new -key myecom-multi.key \
+  -out myecom-multi.csr \
+  -subj "/CN=myecom.net"
+
+# 3. Extensions file — the important bit is subjectAltName with multiple entries
+cat > myecom-multi.ext <<EOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+keyUsage=digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=@alt_names
+
+[alt_names]
+DNS.1 = myecom.net
+DNS.2 = www.myecom.net
+DNS.3 = idp.keycloak.net
+DNS.4 = api.service.net
+DNS.5 = *.myecom.net
+IP.1  = 127.0.0.1
+EOF
+
+# 4. Sign with the local CA from §2.1
+openssl x509 -req -in myecom-multi.csr \
+  -CA ca.crt -CAkey ca.key -CAcreateserial \
+  -out myecom-multi.crt -days 365 -sha256 \
+  -extfile myecom-multi.ext
+```
+
+The `[alt_names]` stanza is the flexible part — add or remove rows as needed. The `DNS.N` / `IP.N` keys are just ordinal labels required by OpenSSL's config parser; the numbers don't have to be contiguous or in any order.
+
+> **Single-line alternative.** If you dislike the alt_names block, you can inline everything:
+> ```bash
+> cat > myecom-multi.ext <<EOF
+> authorityKeyIdentifier=keyid,issuer
+> basicConstraints=CA:FALSE
+> subjectAltName=DNS:myecom.net,DNS:www.myecom.net,DNS:idp.keycloak.net,DNS:api.service.net,DNS:*.myecom.net,IP:127.0.0.1
+> EOF
+> ```
+> Same output, less typing — the `[alt_names]` form is only nicer when you have many entries or want to mix types.
+
+#### 2.7.3 Verify the SANs landed
+
+Always inspect the signed cert before deploying it — typos in the `.ext` file fail silently at signing and loudly at TLS handshake.
+
+```bash
+openssl x509 -in myecom-multi.crt -noout -text \
+  | grep -A1 "Subject Alternative Name"
+# X509v3 Subject Alternative Name:
+#     DNS:myecom.net, DNS:www.myecom.net, DNS:idp.keycloak.net,
+#     DNS:api.service.net, DNS:*.myecom.net, IP Address:127.0.0.1
+```
+
+Or, if you only want the SAN list without the rest of the cert text:
+
+```bash
+openssl x509 -in myecom-multi.crt -noout -ext subjectAltName
+```
+
+Run a handshake to confirm each hostname actually serves this cert (after wiring it into nginx — see §2.7.5):
+
+```bash
+echo | openssl s_client -connect myecom.net:5500 -servername myecom.net 2>/dev/null \
+  | openssl x509 -noout -subject -ext subjectAltName
+
+echo | openssl s_client -connect idp.keycloak.net:8443 -servername idp.keycloak.net 2>/dev/null \
+  | openssl x509 -noout -subject -ext subjectAltName
+```
+
+Both should print the same multi-SAN cert.
+
+#### 2.7.4 Wildcard-only variant
+
+If all your services live under one parent domain (`*.myecom.net`), a single wildcard cert is simpler. Remember the one-label rule — list the apex separately if you need it:
+
+```ini
+subjectAltName=@alt_names
+
+[alt_names]
+DNS.1 = myecom.net              # apex — NOT covered by *.myecom.net
+DNS.2 = *.myecom.net            # covers www.myecom.net, api.myecom.net, idp.myecom.net
+```
+
+This does **not** work for the current project because `idp.keycloak.net` is on a different parent domain — you'd still need a second SAN (or a second cert) for it.
+
+#### 2.7.5 Wire the multi-domain cert into the stack
+
+Swapping in the consolidated cert is a three-file change. Only do this if you're actually consolidating — keeping two separate certs is also a valid design.
+
+**(a) `nginx/default.conf`** — keep as-is, no change needed if you reuse the same filename. To point at the new cert:
+
+```nginx
+server {
+    listen 443 ssl;
+    server_name myecom.net;
+    ssl_certificate     /etc/nginx/certs/myecom-multi.crt;
+    ssl_certificate_key /etc/nginx/certs/myecom-multi.key;
+    ...
+}
+```
+
+**(b) `nginx/keycloak-proxy.conf`** — point at the **same** files:
+
+```nginx
+server {
+    listen 8443 ssl;
+    server_name idp.keycloak.net;
+    ssl_certificate     /etc/nginx/certs/myecom-multi.crt;
+    ssl_certificate_key /etc/nginx/certs/myecom-multi.key;
+    ...
+}
+```
+
+nginx is happy serving the same cert from two `server` blocks because the cert contains both names in SAN — TLS picks the right one based on SNI, and the `server_name` directive picks the right block afterwards.
+
+**(c) Docker Compose** — just drop the new pair into `nginx/certs/` alongside (or instead of) the old ones, then `docker compose up -d --build`. No other change required.
+
+**(d) Kubernetes** — update the `tls-certs` Secret to contain the consolidated pair. Either in addition to the old keys (safe) or instead of them (clean):
+
+```bash
+kubectl delete secret tls-certs
+kubectl create secret generic tls-certs \
+  --from-file=myecom-multi.crt=nginx/certs/myecom-multi.crt \
+  --from-file=myecom-multi.key=nginx/certs/myecom-multi.key
+kubectl rollout restart deployment/nginx
+```
+
+See §8.4.7 for the full rotation flow, including why the rollout restart is needed.
+
+#### 2.7.6 Updating `certs/generate.sh` (optional)
+
+If you want `run.sh` / `deploy-k8s.sh` to produce the multi-SAN cert automatically, replace the two separate signing blocks in `certs/generate.sh` with one. The relevant section becomes:
+
+```bash
+echo "==> Signing multi-domain certificate..."
+openssl genrsa -out "$CERTS_DIR/myecom-multi.key" 2048 2>/dev/null
+openssl req -new -key "$CERTS_DIR/myecom-multi.key" \
+  -out "$CERTS_DIR/myecom-multi.csr" -subj "/CN=myecom.net" 2>/dev/null
+
+cat > "$CERTS_DIR/myecom-multi.ext" <<EXTEOF
+authorityKeyIdentifier=keyid,issuer
+basicConstraints=CA:FALSE
+subjectAltName=DNS:myecom.net,DNS:www.myecom.net,DNS:idp.keycloak.net,DNS:api.service.net,DNS:*.myecom.net,IP:127.0.0.1
+EXTEOF
+
+openssl x509 -req -in "$CERTS_DIR/myecom-multi.csr" \
+  -CA "$CA_CRT" -CAkey "$CA_KEY" -CAcreateserial \
+  -out "$CERTS_DIR/myecom-multi.crt" -days 365 -sha256 \
+  -extfile "$CERTS_DIR/myecom-multi.ext" 2>/dev/null
+```
+
+Then update the copy step in `run.sh` / `deploy-k8s.sh` to copy `myecom-multi.{crt,key}` instead of the two old pairs, and update the `--from-file=` keys for `kubectl create secret tls-certs` to match the filenames referenced in the nginx config (see the filename contract in §8.4.6).
+
+#### 2.7.7 Gotchas
+
+- **`/etc/hosts` must still list every SAN name** you plan to hit locally. SAN doesn't do DNS — it only says "this cert is valid for these names."
+- **Wildcards and apex.** `*.example.com` is **not** `example.com`. Always list both if both are served.
+- **CA trust is unchanged.** The CA (`ca.crt`) signs the multi-SAN leaf the same way it signs a single-SAN leaf. You don't need to re-trust anything when changing leaf SANs.
+- **Don't put SANs in the CSR only.** Some ad-hoc guides put SAN in the CSR and not in the signing `-extfile`. OpenSSL will drop the SAN on sign unless you pass `-copy_extensions copy` — it's safer to put SANs in the `.ext` file passed to `openssl x509 -req` as shown above.
+- **Cert renewals re-issue.** "Adding a name" always means re-signing a fresh cert and rotating it. There's no in-place edit.
+
 ---
 
 ## 3. Keycloak Configuration
