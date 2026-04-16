@@ -77,14 +77,28 @@ This project uses self-signed certificates. You **must** accept the certificates
 
 ### Option A: Trust the CA system-wide (recommended, one-time)
 
-This adds the local CA to macOS Keychain so all browsers trust the certs automatically:
-
+#### macOS
 ```bash
 sudo security add-trusted-cert -d -r trustRoot \
   -k /Library/Keychains/System.keychain certs/ca.crt
 ```
 
-After running this, **quit and reopen** your browser.
+#### RHEL 9 / CentOS 9 / Fedora
+```bash
+sudo cp certs/ca.crt /etc/pki/ca-trust/source/anchors/myecom-local-ca.crt
+sudo update-ca-trust
+```
+
+#### Windows 11 (PowerShell as Administrator)
+```powershell
+certutil -addstore -f "ROOT" certs\ca.crt
+```
+
+Or double-click `certs/ca.crt` → Install Certificate → Local Machine → Trusted Root Certification Authorities.
+
+> **Firefox note:** Firefox uses its own cert store. Open `about:config` and set `security.enterprise_roots.enabled` to `true` to make it trust the OS store.
+
+After running the command for your OS, **quit and reopen** your browser.
 
 ### Option B: Accept certificates manually in browser
 

@@ -103,14 +103,74 @@ openssl x509 -req -in keycloak.csr \
   -extfile keycloak.ext
 ```
 
-### 2.4 Trust the CA (macOS)
+### 2.4 Trust the CA
+
+After generating the CA certificate (`ca.crt`), you must add it to your OS trust store so browsers accept the signed certificates without warnings.
+
+#### macOS
 
 ```bash
 sudo security add-trusted-cert -d -r trustRoot \
   -k /Library/Keychains/System.keychain ca.crt
 ```
 
-This makes Chrome, Safari, and Firefox trust any certificate signed by this CA. Restart browsers after running this.
+Restart Chrome/Safari/Firefox after running this.
+
+To **remove** the CA later:
+```bash
+sudo security remove-trusted-cert -d ca.crt
+```
+
+#### RHEL 9 / CentOS 9 / Fedora
+
+```bash
+# Copy CA cert to the system trust anchors
+sudo cp ca.crt /etc/pki/ca-trust/source/anchors/myecom-local-ca.crt
+
+# Update the system trust store
+sudo update-ca-trust
+
+# Verify it was added
+trust list | grep -i "myecom"
+```
+
+Restart Chrome/Firefox after running this. This also makes `curl` and other CLI tools trust the CA (no need for `-k` flag).
+
+To **remove** the CA later:
+```bash
+sudo rm /etc/pki/ca-trust/source/anchors/myecom-local-ca.crt
+sudo update-ca-trust
+```
+
+#### Windows 11
+
+**Option A: Command line (PowerShell as Administrator)**
+```powershell
+# Import CA into the Trusted Root Certification Authorities store
+certutil -addstore -f "ROOT" ca.crt
+```
+
+To **remove** the CA later:
+```powershell
+certutil -delstore "ROOT" "MyEcom Local CA"
+```
+
+**Option B: GUI**
+1. Double-click `ca.crt` file
+2. Click **Install Certificate...**
+3. Select **Local Machine** → Next
+4. Select **Place all certificates in the following store** → Browse
+5. Choose **Trusted Root Certification Authorities** → OK → Next → Finish
+6. Click **Yes** on the security warning
+
+Restart Chrome/Edge/Firefox after importing.
+
+> **Note for Firefox on all platforms:** Firefox uses its own certificate store by default and may not trust the OS store. To fix this:
+> 1. Open `about:config` in Firefox
+> 2. Set `security.enterprise_roots.enabled` to `true`
+> 3. Restart Firefox
+>
+> This makes Firefox trust certificates from the OS trust store.
 
 ### 2.5 Trust the CA (manual browser acceptance)
 
