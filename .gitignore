@@ -4,6 +4,8 @@ dist/
 test-results/
 playwright-report/
 nginx/certs/
+certs/*.crt
+certs/*.key
 __pycache__/
 *.pyc
 .claude/

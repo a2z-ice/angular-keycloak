@@ -5,7 +5,8 @@ set -euo pipefail
 #   --test    Run Playwright E2E tests after deployment
 
 ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
-CERTS_DIR="$ROOT_DIR/nginx/certs"
+CERTS_DIR="$ROOT_DIR/certs"
+NGINX_CERTS="$ROOT_DIR/nginx/certs"
 E2E_DIR="$ROOT_DIR/e2e"
 CLUSTER_NAME="k8s-angular"
 RUN_TESTS=false
@@ -26,16 +27,17 @@ kind delete cluster --name "$CLUSTER_NAME" 2>/dev/null || true
 # Stop docker compose stack if running (free ports)
 docker compose down -v 2>/dev/null || true
 
-# ── 2. Generate SSL certs ────────────────────────────────────────
-echo "==> Generating SSL certificates..."
-mkdir -p "$CERTS_DIR"
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-  -keyout "$CERTS_DIR/selfsigned.key" -out "$CERTS_DIR/selfsigned.crt" \
-  -subj "/CN=myecom.net" 2>/dev/null
-openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
-  -keyout "$CERTS_DIR/keycloak.key" -out "$CERTS_DIR/keycloak.crt" \
-  -subj "/CN=idp.keycloak.net" 2>/dev/null
-echo "    Certificates created."
+# ── 2. Generate certs if CA doesn't exist ────────────────────────
+if [ ! -f "$CERTS_DIR/ca.crt" ]; then
+  echo "==> Generating CA-signed SSL certificates..."
+  "$CERTS_DIR/generate.sh"
+else
+  echo "==> Certificates already exist (reusing)."
+fi
+
+mkdir -p "$NGINX_CERTS"
+cp "$CERTS_DIR/selfsigned.crt" "$CERTS_DIR/selfsigned.key" \
+   "$CERTS_DIR/keycloak.crt" "$CERTS_DIR/keycloak.key" "$NGINX_CERTS/"
 
 # ── 3. Build Docker images ───────────────────────────────────────
 echo "==> Building Docker images..."
@@ -56,10 +58,10 @@ echo "    Images loaded."
 # ── 6. Create TLS secret ─────────────────────────────────────────
 echo "==> Creating TLS secrets..."
 kubectl create secret generic tls-certs \
-  --from-file=selfsigned.crt="$CERTS_DIR/selfsigned.crt" \
-  --from-file=selfsigned.key="$CERTS_DIR/selfsigned.key" \
-  --from-file=keycloak.crt="$CERTS_DIR/keycloak.crt" \
-  --from-file=keycloak.key="$CERTS_DIR/keycloak.key"
+  --from-file=selfsigned.crt="$NGINX_CERTS/selfsigned.crt" \
+  --from-file=selfsigned.key="$NGINX_CERTS/selfsigned.key" \
+  --from-file=keycloak.crt="$NGINX_CERTS/keycloak.crt" \
+  --from-file=keycloak.key="$NGINX_CERTS/keycloak.key"
 
 # ── 7. Deploy manifests ──────────────────────────────────────────
 echo "==> Deploying Keycloak..."
@@ -102,7 +104,7 @@ if [ "$RUN_TESTS" = true ]; then
   echo "==> Installing E2E dependencies..."
   cd "$E2E_DIR"
   npm install --silent
-  npx playwright install chromium 2>/dev/null
+  npx playwright install chromium firefox webkit 2>/dev/null
 
   echo "==> Running Playwright E2E tests..."
   rm -rf test-results
