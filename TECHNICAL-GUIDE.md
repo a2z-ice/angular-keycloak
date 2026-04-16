@@ -724,15 +724,6 @@ kind load docker-image myecom-angular:latest --name k8s-angular
 kind load docker-image myecom-api:latest --name k8s-angular
 ```
 
-**TLS certs stored as a K8s Secret:**
-```bash
-kubectl create secret generic tls-certs \
-  --from-file=selfsigned.crt=nginx/certs/selfsigned.crt \
-  --from-file=selfsigned.key=nginx/certs/selfsigned.key \
-  --from-file=keycloak.crt=nginx/certs/keycloak.crt \
-  --from-file=keycloak.key=nginx/certs/keycloak.key
-```
-
 **Nginx pod mounts ConfigMap (overrides baked-in config) + Secret (certs):**
 ```yaml
 volumes:
@@ -743,6 +734,299 @@ volumes:
     secret:
       secretName: tls-certs    # .crt + .key files
 ```
+
+See [section 8.4](#84-tls-certs-secret-lifecycle) for the full lifecycle of `tls-certs`.
+
+### 8.4 tls-certs Secret lifecycle
+
+The `tls-certs` Secret is how the locally-generated SSL material from `certs/generate.sh` reaches the nginx pod inside the Kind cluster. Nginx needs four files on disk — two cert/key pairs, one for each `server_name` it listens on — and a Kubernetes `generic` Secret is the cleanest way to inject them without baking private keys into the image.
+
+The flow end-to-end:
+
+```
+certs/generate.sh  ─►  nginx/certs/*.crt,*.key  ─►  kubectl create secret tls-certs
+                                                              │
+                                                              ▼
+                                                 K8s API server (stored in etcd)
+                                                              │
+                                                              ▼ (kubelet pull on pod start)
+                                                 tmpfs volume in nginx pod
+                                                              │
+                                                              ▼ (mounted at /etc/nginx/certs)
+                                                 nginx reads ssl_certificate paths
+```
+
+Each step in detail below.
+
+#### 1. Source files on the host
+
+`certs/generate.sh` builds a local CA (`ca.key` / `ca.crt`) and then signs two leaf certificates — one per hostname nginx serves. After it runs, `deploy-k8s.sh` copies the four files nginx needs from `certs/` into `nginx/certs/`:
+
+```
+nginx/certs/
+├── selfsigned.crt   # PEM, CN=myecom.net,        SAN=DNS:myecom.net        (served on :443)
+├── selfsigned.key   # PEM, unencrypted RSA 2048 private key
+├── keycloak.crt     # PEM, CN=idp.keycloak.net,  SAN=DNS:idp.keycloak.net  (served on :8443)
+└── keycloak.key     # PEM, unencrypted RSA 2048 private key
+```
+
+Two important notes:
+
+- **Unencrypted keys.** `openssl genrsa` in `generate.sh` writes private keys without a passphrase. nginx starts non-interactively inside a container, so it can't prompt for one. If you ever re-generate with `-aes256` you will need either `ssl_password_file` in nginx or a different strategy — plain keys are the right default here.
+- **The CA (`ca.crt`) is deliberately NOT in the Secret.** The CA is what *browsers and the Flask JWT validator* need to trust; the server only needs its own leaf cert + key. Mixing them would be harmless but it's clearer to keep responsibilities split: `nginx/certs/` = server material, `certs/ca.crt` = trust anchor.
+
+Quick sanity check that a cert and key actually belong together (matching modulus means they're a valid pair):
+
+```bash
+openssl x509 -in nginx/certs/selfsigned.crt -noout -modulus | openssl md5
+openssl rsa  -in nginx/certs/selfsigned.key -noout -modulus | openssl md5
+# Both hashes must be identical. If they differ, nginx will fail with:
+#   SSL_CTX_use_PrivateKey_file() failed ... key values mismatch
+```
+
+#### 2. Create the Secret (imperative form used by `deploy-k8s.sh`)
+
+`deploy-k8s.sh` creates the Secret before applying any manifests so it exists by the time the nginx Deployment is scheduled:
+
+```bash
+kubectl create secret generic tls-certs \
+  --from-file=selfsigned.crt=nginx/certs/selfsigned.crt \
+  --from-file=selfsigned.key=nginx/certs/selfsigned.key \
+  --from-file=keycloak.crt=nginx/certs/keycloak.crt \
+  --from-file=keycloak.key=nginx/certs/keycloak.key
+```
+
+Breakdown of the flags:
+
+| Flag | Meaning |
+|------|---------|
+| `generic` | Arbitrary key/value payload. Other subtypes (`tls`, `docker-registry`) impose fixed keys and are wrong for this use case. |
+| `tls-certs` | The Secret's `metadata.name`. Referenced verbatim as `secretName: tls-certs` in the Deployment. |
+| `--from-file=<key>=<path>` | Read the file at `<path>`, base64-encode it, store it under the map key `<key>`. When the Secret is later mounted as a volume, `<key>` becomes the **filename**. This is the contract nginx depends on. |
+
+If you omit the `<key>=` prefix (`--from-file=nginx/certs/selfsigned.crt`), `kubectl` uses the basename of the path as the key — which happens to be fine here but is fragile if you ever move files around, so the explicit form is preferred.
+
+> **Why `generic` and not `kubernetes.io/tls`?** A `tls` Secret enforces exactly two keys: `tls.crt` and `tls.key`. We need **two independent pairs** — one for `myecom.net:443`, one for `idp.keycloak.net:8443` — so a single `tls` Secret can't represent it. Options were:
+> - Two separate `tls` Secrets (`tls-myecom` + `tls-keycloak`) — more idiomatic but requires two volume mounts and two ConfigMap edits.
+> - One `generic` Secret with four named keys — one mount, one config path convention. We picked this for simplicity.
+
+Verify what landed in etcd:
+
+```bash
+# List the map keys (file names that will appear in the pod)
+kubectl get secret tls-certs -o jsonpath='{.data}' | jq 'keys'
+# [ "keycloak.crt", "keycloak.key", "selfsigned.crt", "selfsigned.key" ]
+
+# Decode one entry back to PEM and confirm it's the cert you expect
+kubectl get secret tls-certs -o jsonpath='{.data.selfsigned\.crt}' \
+  | base64 -d \
+  | openssl x509 -noout -subject -issuer -dates
+# subject= CN=myecom.net
+# issuer=  CN=MyEcom Local CA
+# notBefore=... notAfter=...
+```
+
+#### 3. Declarative equivalent (for reference)
+
+`kubectl create secret generic --from-file=...` is just sugar over the following YAML. Showing it makes the base64 encoding explicit:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: tls-certs
+type: Opaque               # same as "generic" on the CLI
+data:                      # values here MUST be base64-encoded
+  selfsigned.crt: LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t...
+  selfsigned.key: LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t...
+  keycloak.crt:   LS0tLS1CRUdJTiBDRVJUSUZJQ0FURS0tLS0t...
+  keycloak.key:   LS0tLS1CRUdJTiBQUklWQVRFIEtFWS0tLS0t...
+```
+
+To produce a value by hand:
+
+```bash
+base64 -w0 nginx/certs/selfsigned.crt      # Linux
+base64     nginx/certs/selfsigned.crt      # macOS (already single-line friendly)
+```
+
+> **Warning:** `data` holds base64 **not** encryption. Anyone with read access to the Secret can decode it in one command. Never commit this YAML to Git. If you want human-readable input, use `stringData:` — the API server will base64-encode on write:
+> ```yaml
+> stringData:
+>   selfsigned.crt: |
+>     -----BEGIN CERTIFICATE-----
+>     MIID...
+>     -----END CERTIFICATE-----
+> ```
+
+We use the imperative form in `deploy-k8s.sh` because it keeps private-key bytes out of any checked-in file.
+
+#### 4. How the nginx Deployment consumes it
+
+In `k8s/nginx.yaml`, the Secret is wired up in **two** places on the Pod spec — one declares the volume, the other mounts it into the container. The names must match.
+
+```yaml
+spec:
+  containers:
+    - name: nginx
+      image: myecom-angular:latest
+      volumeMounts:                        # ─── (b) container-level
+        - name: tls-certs                  # must match volumes[].name below
+          mountPath: /etc/nginx/certs      # directory nginx reads from
+          readOnly: true                   # defensive; Secret volumes are read-only anyway
+  volumes:                                 # ─── (a) pod-level
+    - name: tls-certs                      # volume name (arbitrary, local to pod)
+      secret:
+        secretName: tls-certs              # name of the Secret object from step 2
+        # defaultMode: 0400                # optional; tightens file perms if needed
+        # optional: false                  # default — pod will fail to start if Secret missing
+```
+
+What the kubelet actually does when the pod starts:
+
+1. It reads the `tls-certs` Secret from the API server.
+2. It creates a **tmpfs** volume on the node (Secret volumes are in-memory — they never touch disk on the host, which is why Secrets are slightly safer than hostPath files).
+3. For each key in `Secret.data`, it writes one file into that tmpfs with the key as the filename and the base64-decoded value as the contents.
+4. It bind-mounts that tmpfs into the container at `mountPath`.
+
+The result inside the container:
+
+```
+$ kubectl exec deploy/nginx -- ls -l /etc/nginx/certs
+total 0
+lrwxrwxrwx 1 root root 21 Apr 16 09:47 keycloak.crt   -> ..data/keycloak.crt
+lrwxrwxrwx 1 root root 21 Apr 16 09:47 keycloak.key   -> ..data/keycloak.key
+lrwxrwxrwx 1 root root 23 Apr 16 09:47 selfsigned.crt -> ..data/selfsigned.crt
+lrwxrwxrwx 1 root root 23 Apr 16 09:47 selfsigned.key -> ..data/selfsigned.key
+```
+
+(The `..data` → timestamped-directory symlink indirection is how kubelet supports atomic updates when the Secret changes — see §8.4.7.)
+
+File permissions default to `0644` for files, `0755` for the directory. If you want stricter permissions (recommended for real production keys), set `defaultMode: 0400` under the `secret:` block or `mode: 0400` per item in a `secret.items[]` list.
+
+If the Secret is missing when the pod starts, the pod stays in `ContainerCreating` with:
+
+```
+MountVolume.SetUp failed for volume "tls-certs" : secret "tls-certs" not found
+```
+
+That's why `deploy-k8s.sh` creates the Secret *before* `kubectl apply -f k8s/nginx.yaml`.
+
+#### 5. How nginx uses the mounted files
+
+The `nginx-config` ConfigMap (also in `k8s/nginx.yaml`) hard-codes the paths that match the Secret's map keys:
+
+```nginx
+# default.conf   → Angular SPA + /api reverse proxy, listens on :443
+server {
+    listen 443 ssl;
+    server_name myecom.net;
+    ssl_certificate     /etc/nginx/certs/selfsigned.crt;
+    ssl_certificate_key /etc/nginx/certs/selfsigned.key;
+    ...
+}
+
+# keycloak-proxy.conf → Keycloak SSL termination, listens on :8443
+server {
+    listen 8443 ssl;
+    server_name idp.keycloak.net;
+    ssl_certificate     /etc/nginx/certs/keycloak.crt;
+    ssl_certificate_key /etc/nginx/certs/keycloak.key;
+    ...
+}
+```
+
+Two Secret-related things to notice:
+
+- **Both `server` blocks live in the same nginx process**, each with its own cert. This is why we need two pairs in one Secret rather than one pair in a `kubernetes.io/tls` Secret.
+- **nginx reads the cert files once at startup** (or on `nginx -s reload`). Changing the Secret contents does NOT hot-reload nginx — see §8.4.7 for the rotation flow.
+
+Quick runtime checks from outside the cluster:
+
+```bash
+# What cert is served on :5500 (the Angular SPA edge)?
+echo | openssl s_client -connect myecom.net:5500 -servername myecom.net 2>/dev/null \
+  | openssl x509 -noout -subject -issuer
+# subject= CN=myecom.net
+# issuer=  CN=MyEcom Local CA
+
+# And on :8443 (the Keycloak proxy)?
+echo | openssl s_client -connect idp.keycloak.net:8443 -servername idp.keycloak.net 2>/dev/null \
+  | openssl x509 -noout -subject -issuer
+# subject= CN=idp.keycloak.net
+# issuer=  CN=MyEcom Local CA
+```
+
+#### 6. Filename contract — the thing to keep in sync
+
+Three places must agree on the filenames `selfsigned.crt`, `selfsigned.key`, `keycloak.crt`, `keycloak.key`:
+
+1. The `--from-file=<key>=...` keys in `deploy-k8s.sh` (controls Secret map keys → mounted filenames).
+2. The `ssl_certificate` / `ssl_certificate_key` paths in the `nginx-config` ConfigMap (controls what nginx reads).
+3. The filenames produced by `certs/generate.sh` (controls what gets copied into `nginx/certs/`).
+
+If any of these drift, the symptoms are:
+
+| Drift | Symptom |
+|-------|---------|
+| Secret key renamed, nginx.conf unchanged | nginx CrashLoopBackOff: `cannot load certificate "/etc/nginx/certs/selfsigned.crt": BIO_new_file() ... No such file or directory` |
+| `generate.sh` writes different filename than `deploy-k8s.sh` expects | `deploy-k8s.sh` fails at `kubectl create secret` with "file not found" |
+| `mountPath` changed but nginx.conf unchanged | Same nginx BIO_new_file error — directory exists but files don't |
+
+`kubectl describe pod/<nginx-pod>` and `kubectl logs deploy/nginx` will show the actual reason in each case.
+
+#### 7. Rotating certs (the right way)
+
+Secret volumes are automatically refreshed on the node — the kubelet updates the `..data` symlink to point at a new directory when the Secret changes — but **nginx won't pick up new files until the worker processes are recycled**. The simplest reliable flow is rolling the Deployment:
+
+```bash
+# 1. Regenerate cert material (on the host)
+./certs/generate.sh
+cp certs/selfsigned.{crt,key} certs/keycloak.{crt,key} nginx/certs/
+
+# 2. Replace the Secret atomically (delete + recreate, or apply --force)
+kubectl delete secret tls-certs
+kubectl create secret generic tls-certs \
+  --from-file=selfsigned.crt=nginx/certs/selfsigned.crt \
+  --from-file=selfsigned.key=nginx/certs/selfsigned.key \
+  --from-file=keycloak.crt=nginx/certs/keycloak.crt \
+  --from-file=keycloak.key=nginx/certs/keycloak.key
+
+# 3. Trigger a rolling restart so nginx re-reads the certs
+kubectl rollout restart deployment/nginx
+kubectl rollout status  deployment/nginx
+```
+
+A pure `kubectl exec deploy/nginx -- nginx -s reload` would also work *if* the kubelet has already refreshed the projected files (can take up to the kubelet's sync period, default ~60s). Rolling the Deployment is deterministic and only costs a few seconds of 502s on a single-replica demo stack.
+
+#### 8. Debugging checklist
+
+When TLS doesn't work after deploy, check in this order:
+
+```bash
+# Is the Secret present and complete?
+kubectl get secret tls-certs -o jsonpath='{.data}' | jq 'keys'
+# Expect: ["keycloak.crt","keycloak.key","selfsigned.crt","selfsigned.key"]
+
+# Is the nginx pod running? If not, why?
+kubectl get pods -l app=nginx
+kubectl describe pod -l app=nginx | grep -A3 -i 'mount\|secret\|event'
+
+# What does nginx see on disk?
+kubectl exec deploy/nginx -- ls -l /etc/nginx/certs
+kubectl exec deploy/nginx -- openssl x509 -in /etc/nginx/certs/selfsigned.crt -noout -subject
+
+# What does nginx actually say on startup?
+kubectl logs deploy/nginx --tail=50
+
+# End-to-end: does the cert served match the one in the Secret?
+kubectl exec deploy/nginx -- openssl x509 -in /etc/nginx/certs/selfsigned.crt -noout -fingerprint -sha256
+echo | openssl s_client -connect myecom.net:5500 -servername myecom.net 2>/dev/null \
+  | openssl x509 -noout -fingerprint -sha256
+# Both fingerprints should match.
+```
+
+A cert/key modulus mismatch (the #1 way this fails after a regeneration) is easiest to catch with the `openssl x509 -modulus | md5` vs `openssl rsa -modulus | md5` comparison from §8.4.1.
 
 **NodePort Service exposes nginx through Kind port mappings:**
 ```yaml
@@ -757,14 +1041,14 @@ spec:
       nodePort: 30844           # → host port 8443
 ```
 
-### 8.4 Deploy
+### 8.5 Deploy
 
 ```bash
 ./deploy-k8s.sh           # Deploy only
 ./deploy-k8s.sh --test    # Deploy + run 54 E2E tests
 ```
 
-### 8.5 Teardown
+### 8.6 Teardown
 
 ```bash
 kind delete cluster --name k8s-angular
