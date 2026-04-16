@@ -2,12 +2,58 @@
 
 ## Prerequisites
 
-1. Docker installed and running
-2. The following entries in `/etc/hosts`:
-   ```
-   127.0.0.1  idp.keycloak.net  myecom.net  api.service.net
-   ```
-3. Chrome/Firefox browser
+### Required Software
+| Software | Version | Check Command |
+|----------|---------|---------------|
+| Docker | 20+ | `docker --version` |
+| Node.js | 20+ | `node --version` |
+| npm | 9+ | `npm --version` |
+| openssl | any | `openssl version` |
+| curl | any | `curl --version` |
+
+### For Kubernetes Deployment (optional)
+| Software | Version | Check Command |
+|----------|---------|---------------|
+| Kind | 0.20+ | `kind version` |
+| kubectl | 1.28+ | `kubectl version --client` |
+
+### For E2E Tests (optional)
+| Software | Version | Check Command |
+|----------|---------|---------------|
+| Playwright | 1.50+ | installed via `npm install` in `e2e/` |
+
+### Host Entries
+
+Add the following to `/etc/hosts` (requires `sudo`):
+```bash
+sudo sh -c 'echo "127.0.0.1  idp.keycloak.net  myecom.net  api.service.net" >> /etc/hosts'
+```
+
+Verify:
+```bash
+ping -c 1 myecom.net        # should resolve to 127.0.0.1
+ping -c 1 idp.keycloak.net  # should resolve to 127.0.0.1
+```
+
+### Ports
+
+The following ports must be free on your machine:
+| Port | Used By |
+|------|---------|
+| 5500 | Angular app (nginx HTTPS) |
+| 8443 | Keycloak proxy (nginx HTTPS) |
+| 8000 | Python API (Docker Compose only) |
+
+Check if ports are free:
+```bash
+lsof -i :5500
+lsof -i :8443
+lsof -i :8000
+```
+
+### Browser
+
+Any of: Chrome, Safari, or Firefox. You will need to accept self-signed certificates (see Section 2).
 
 ## 1. Start the Stack
 
@@ -25,16 +71,67 @@ Wait until you see all services return `200`.
 
 ---
 
-## 2. Accept Self-Signed Certificate
+## 2. Trust the SSL Certificates
 
-Open **https://idp.keycloak.net:8443** in your browser. You will see a certificate warning.
+This project uses self-signed certificates. You **must** accept the certificates in your browser before the OIDC login flow will work.
 
-- **Chrome**: Click "Advanced" → "Proceed to idp.keycloak.net (unsafe)"
-- **Firefox**: Click "Advanced" → "Accept the Risk and Continue"
+### Option A: Trust the CA system-wide (recommended, one-time)
 
-Do the same for **https://myecom.net:5500**.
+This adds the local CA to macOS Keychain so all browsers trust the certs automatically:
 
-> **Important:** You must accept both certificates before testing, otherwise the OIDC redirect will fail silently.
+```bash
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain certs/ca.crt
+```
+
+After running this, **quit and reopen** your browser.
+
+### Option B: Accept certificates manually in browser
+
+You must accept **both** domains in order. The Keycloak cert must be accepted first, otherwise the Angular app's OIDC config fetch will fail silently.
+
+#### Chrome
+
+1. **Clear HSTS cache first** (if you see "HSTS" error with no "Advanced" button):
+   - Open `chrome://net-internals/#hsts`
+   - Under "Delete domain security policies", type `myecom.net` and click **Delete**
+   - Do the same for `idp.keycloak.net`
+
+2. **Accept Keycloak cert** (do this FIRST):
+   - Open `https://idp.keycloak.net:8443`
+   - Click **Advanced** → **Proceed to idp.keycloak.net (unsafe)**
+   - You should see the Keycloak welcome page
+
+3. **Accept Angular app cert**:
+   - Open `https://myecom.net:5500`
+   - Click **Advanced** → **Proceed to myecom.net (unsafe)**
+   - You should see the MyEcom home page
+
+#### Safari
+
+1. **Accept Keycloak cert** (do this FIRST):
+   - Open `https://idp.keycloak.net:8443`
+   - Click **Show Details** → **visit this website**
+   - Enter your Mac password when prompted
+   - You should see the Keycloak welcome page
+
+2. **Accept Angular app cert**:
+   - Open `https://myecom.net:5500`
+   - Click **Show Details** → **visit this website**
+   - Enter your Mac password when prompted
+   - You should see the MyEcom home page
+
+#### Firefox
+
+1. **Accept Keycloak cert** (do this FIRST):
+   - Open `https://idp.keycloak.net:8443`
+   - Click **Advanced** → **Accept the Risk and Continue**
+
+2. **Accept Angular app cert**:
+   - Open `https://myecom.net:5500`
+   - Click **Advanced** → **Accept the Risk and Continue**
+
+> **Why Keycloak first?** The Angular app fetches OIDC configuration from `https://idp.keycloak.net:8443` in the background. If your browser hasn't accepted that certificate yet, the fetch fails silently and login won't work — the Login button will do nothing.
 
 ---
 
@@ -44,7 +141,7 @@ Do the same for **https://myecom.net:5500**.
 |------|--------|-----------------|
 | 3.1 | Open `https://myecom.net:5500` | Home page with "Welcome to MyEcom" and a **Login** button |
 | 3.2 | Check the navbar | Only **Home** and **Login** visible |
-| 3.3 | Click **Dashboard** link (if visible) or navigate to `https://myecom.net:5500/dashboard` | Redirected to Keycloak login page at `idp.keycloak.net` |
+| 3.3 | Navigate to `https://myecom.net:5500/dashboard` | Redirected to Keycloak login page at `idp.keycloak.net` |
 
 ---
 
@@ -184,19 +281,38 @@ curl -sk -H "Authorization: Bearer $ADMIN_TOKEN" https://myecom.net:5500/api/adm
 
 ## 12. Run Automated E2E Tests
 
+### Headless (all 3 browsers)
 ```bash
-# From project root
 cd e2e
 npm install
-npx playwright install chromium
+npx playwright install chromium firefox webkit
 npx playwright test
-
-# Or use the scripts
-./run.sh --test          # Docker Compose
-./deploy-k8s.sh --test   # Kind Kubernetes
 ```
 
-All 12 tests should pass covering authentication flow, user role access, and admin role access.
+### Headed — watch tests run in a visible browser
+```bash
+# Chromium (Chrome)
+npx playwright test --headed --project=chromium
+
+# WebKit (Safari)
+npx playwright test --headed --project=webkit
+
+# Firefox
+npx playwright test --headed --project=firefox
+```
+
+### Using the deployment scripts
+```bash
+./run.sh --test          # Docker Compose + all 54 tests
+./deploy-k8s.sh --test   # Kind Kubernetes + all 54 tests
+```
+
+54 tests total (18 per browser) covering:
+- Authentication flow (login, redirect, logout)
+- User role access (dashboard, profile, products)
+- User role restriction (admin pages show Access Denied)
+- Admin role access (all pages)
+- API endpoints (health, auth 401, authz 403, user/admin CRUD)
 
 ---
 
@@ -225,6 +341,9 @@ All 12 tests should pass covering authentication flow, user role access, and adm
 
 | Problem | Solution |
 |---------|----------|
+| Chrome shows HSTS error with no "Advanced" button | Go to `chrome://net-internals/#hsts`, delete `myecom.net` and `idp.keycloak.net` |
+| Login button does nothing | You haven't accepted the Keycloak cert. Visit `https://idp.keycloak.net:8443` first and accept |
+| Safari shows "certificate is invalid" errors in console | Visit `https://idp.keycloak.net:8443` in Safari, click Show Details → visit this website |
 | Login redirects but page stays blank | Accept the self-signed cert for `idp.keycloak.net:8443` in your browser first |
 | "Access Denied" immediately after login | Clear browser storage (localStorage, sessionStorage) and try again |
 | API returns 401 with valid token | The JWKS cache may be stale; restart the API container |
