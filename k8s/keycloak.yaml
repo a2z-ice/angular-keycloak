@@ -1,0 +1,126 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: keycloak-realm
+data:
+  realm-export.json: |
+    {
+      "realm": "myecom",
+      "enabled": true,
+      "sslRequired": "none",
+      "registrationAllowed": false,
+      "loginWithEmailAllowed": true,
+      "duplicateEmailsAllowed": false,
+      "resetPasswordAllowed": false,
+      "editUsernameAllowed": false,
+      "bruteForceProtected": false,
+      "roles": {
+        "realm": [
+          { "name": "admin", "description": "Administrator role with full access" },
+          { "name": "user", "description": "Standard user role with limited access" }
+        ]
+      },
+      "clients": [
+        {
+          "clientId": "myecom-spa",
+          "name": "MyEcom SPA",
+          "enabled": true,
+          "publicClient": true,
+          "directAccessGrantsEnabled": true,
+          "standardFlowEnabled": true,
+          "implicitFlowEnabled": false,
+          "protocol": "openid-connect",
+          "rootUrl": "https://myecom.net:5500",
+          "baseUrl": "https://myecom.net:5500",
+          "redirectUris": ["https://myecom.net:5500/*"],
+          "webOrigins": ["https://myecom.net:5500"],
+          "attributes": {
+            "pkce.code.challenge.method": "S256",
+            "post.logout.redirect.uris": "https://myecom.net:5500/*"
+          },
+          "fullScopeAllowed": true,
+          "defaultClientScopes": ["web-origins", "acr", "profile", "roles", "email"]
+        }
+      ],
+      "users": [
+        {
+          "username": "user1",
+          "enabled": true,
+          "emailVerified": true,
+          "firstName": "User",
+          "lastName": "One",
+          "email": "user1@myecom.net",
+          "credentials": [{ "type": "password", "value": "user1", "temporary": false }],
+          "realmRoles": ["user", "default-roles-myecom"]
+        },
+        {
+          "username": "admin1",
+          "enabled": true,
+          "emailVerified": true,
+          "firstName": "Admin",
+          "lastName": "One",
+          "email": "admin1@myecom.net",
+          "credentials": [{ "type": "password", "value": "admin1", "temporary": false }],
+          "realmRoles": ["admin", "default-roles-myecom"]
+        }
+      ]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: keycloak
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: keycloak
+  template:
+    metadata:
+      labels:
+        app: keycloak
+    spec:
+      containers:
+        - name: keycloak
+          image: quay.io/keycloak/keycloak:26.2.5
+          args: ["start-dev", "--import-realm"]
+          env:
+            - name: KC_BOOTSTRAP_ADMIN_USERNAME
+              value: admin
+            - name: KC_BOOTSTRAP_ADMIN_PASSWORD
+              value: admin
+            - name: KC_PROXY_HEADERS
+              value: xforwarded
+          ports:
+            - containerPort: 8080
+          volumeMounts:
+            - name: realm-config
+              mountPath: /opt/keycloak/data/import/realm-export.json
+              subPath: realm-export.json
+              readOnly: true
+          readinessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 5
+            failureThreshold: 20
+          livenessProbe:
+            tcpSocket:
+              port: 8080
+            initialDelaySeconds: 60
+            periodSeconds: 10
+      volumes:
+        - name: realm-config
+          configMap:
+            name: keycloak-realm
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: keycloak
+spec:
+  selector:
+    app: keycloak
+  ports:
+    - port: 8080
+      targetPort: 8080

@@ -1,0 +1,95 @@
+{
+  "realm": "myecom",
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": false,
+  "editUsernameAllowed": false,
+  "bruteForceProtected": false,
+  "roles": {
+    "realm": [
+      {
+        "name": "admin",
+        "description": "Administrator role with full access"
+      },
+      {
+        "name": "user",
+        "description": "Standard user role with limited access"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "myecom-spa",
+      "name": "MyEcom SPA",
+      "enabled": true,
+      "publicClient": true,
+      "directAccessGrantsEnabled": true,
+      "standardFlowEnabled": true,
+      "implicitFlowEnabled": false,
+      "protocol": "openid-connect",
+      "rootUrl": "https://myecom.net:5500",
+      "baseUrl": "https://myecom.net:5500",
+      "redirectUris": [
+        "https://myecom.net:5500/*"
+      ],
+      "webOrigins": [
+        "https://myecom.net:5500"
+      ],
+      "attributes": {
+        "pkce.code.challenge.method": "S256",
+        "post.logout.redirect.uris": "https://myecom.net:5500/*"
+      },
+      "fullScopeAllowed": true,
+      "defaultClientScopes": [
+        "web-origins",
+        "acr",
+        "profile",
+        "roles",
+        "email"
+      ]
+    }
+  ],
+  "users": [
+    {
+      "username": "user1",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "User",
+      "lastName": "One",
+      "email": "user1@myecom.net",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "user1",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "user",
+        "default-roles-myecom"
+      ]
+    },
+    {
+      "username": "admin1",
+      "enabled": true,
+      "emailVerified": true,
+      "firstName": "Admin",
+      "lastName": "One",
+      "email": "admin1@myecom.net",
+      "credentials": [
+        {
+          "type": "password",
+          "value": "admin1",
+          "temporary": false
+        }
+      ],
+      "realmRoles": [
+        "admin",
+        "default-roles-myecom"
+      ]
+    }
+  ]
+}

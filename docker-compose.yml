@@ -1,0 +1,54 @@
+services:
+  # Keycloak runs HTTP-only internally. SSL is terminated by nginx (angular-app container).
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.2.5
+    container_name: keycloak
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+      KC_PROXY_HEADERS: xforwarded
+    command:
+      - start-dev
+      - --import-realm
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    networks:
+      - myecom-net
+    healthcheck:
+      test: ["CMD-SHELL", "cat < /dev/null > /dev/tcp/localhost/8080"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+
+  api:
+    build:
+      context: ./api
+    container_name: api
+    ports:
+      - "8000:8000"
+    networks:
+      - myecom-net
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+  angular-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: angular-app
+    ports:
+      - "5500:443"
+      - "8443:8443"
+    volumes:
+      - ./nginx/certs:/etc/nginx/certs:ro
+    networks:
+      - myecom-net
+    depends_on:
+      keycloak:
+        condition: service_healthy
+
+networks:
+  myecom-net:
+    driver: bridge

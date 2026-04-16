@@ -1,0 +1,9 @@
+**/node_modules/
+dist/
+.angular/
+test-results/
+playwright-report/
+nginx/certs/
+__pycache__/
+*.pyc
+.claude/
